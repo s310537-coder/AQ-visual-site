@@ -1,0 +1,342 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <script src="https://unpkg.com/leaflet.heat/dist/leaflet-heat.js"></script>
+    <meta charset="utf-8" />
+    <title>Air Map — 即時空品地圖</title>
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css" />
+    <style>
+      body {
+        font-family: Arial, sans-serif;
+        margin: 0;
+        padding: 0;
+      }
+      header {
+        padding: 10px;
+        background: #f4f4f4;
+        display: flex;
+        gap: 12px;
+        align-items: center;
+      }
+      #map {
+        height: calc(100vh - 64px);
+      }
+      .control {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+      }
+      select,
+      button {
+        padding: 6px 8px;
+      }
+      .legend {
+        background: white;
+        padding: 8px;
+        border-radius: 4px;
+        box-shadow: 0 1px 4px rgba(0, 0, 0, 0.2);
+        line-height: 1.4;
+      }
+      .legend div {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+        margin-bottom: 4px;
+      }
+      .swatch {
+        width: 16px;
+        height: 12px;
+        border: 1px solid #ccc;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h3 style="margin: 0">即時空品地圖</h3>
+      <div class="control">
+        <label for="metric">顯示指標：</label>
+        <select id="metric">
+          <option value="aqi">AQI (PM2.5)</option>
+          <option value="pm25">PM2.5 (μg/m³)</option>
+          <option value="pm10">PM10 (μg/m³)</option>
+          <option value="mq135">MQ135 (raw)</option>
+          <option value="temp">溫度 (°C)</option>
+          <option value="hum">濕度 (%)</option>
+        </select>
+      </div>
+      <div class="control">
+        <label for="viewmode">顯示模式：</label>
+        <select id="viewmode">
+          <option value="markers">標記點</option>
+          <option value="heat">熱力圖</option>
+        </select>
+      </div>
+      <div style="flex: 1"></div>
+      <div id="status">連線中…</div>
+    </header>
+
+    <div id="map"></div>
+
+    <!-- Leaflet -->
+    <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+    <!-- Firebase (compat for <script> usage) -->
+    <script src="https://www.gstatic.com/firebasejs/9.22.1/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/9.22.1/firebase-database-compat.js"></script>
+
+    <script>
+      // ---------- 1. Firebase config: 換成你的設定 ----------
+      const firebaseConfig = {
+        apiKey: 'AIzaSyC--qvJJjP5DAfkxYax49t_DOslgO37N6U',
+        authDomain: 'air-quality-visualization-site.firebaseapp.com',
+        databaseURL:
+          'https://air-quality-visualization-site-default-rtdb.asia-southeast1.firebasedatabase.app',
+        projectId: 'air-quality-visualization-site',
+        storageBucket: 'air-quality-visualization-site.firebasestorage.app',
+        messagingSenderId: '1060348839032',
+        appId: '1:1060348839032:web:cef6c6c1c81f6eca41d98d',
+        measurementId: 'G-2JRMXTHPJX',
+      };
+
+      firebase.initializeApp(firebaseConfig);
+      const db = firebase.database();
+
+      // ---------- 2. Leaflet 地圖初始化（用嘉義中心座標示範） ----------
+      const map = L.map('map', {
+        center: [23.478327223336112, 120.46448824232894], // 中心座標
+        zoom: 14, // 固定縮放等級
+        dragging: true, // 禁止拖曳
+        scrollWheelZoom: true, // 禁止滑鼠滾輪縮放
+        doubleClickZoom: false, // 禁止雙擊縮放
+        boxZoom: false, // 禁止框選縮放
+        touchZoom: false, // 禁止手機捏合縮放
+      }).setView([23.47, 120.46], 14);
+      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        attribution: '© OpenStreetMap',
+      }).addTo(map);
+
+      // ---------- 3. UI 元件 ----------
+      const metricSelect = document.getElementById('metric');
+      const statusEl = document.getElementById('status');
+      const viewModeSelect = document.getElementById('viewmode');
+      let heatLayer = null; // 熱力圖圖層
+
+      // ---------- 4. 儲存 markers 與資料 ----------
+      const markers = {}; // markers[deviceId] = Leaflet marker
+      const latestData = {}; // latestData[deviceId] = record.current
+
+      // ---------- 5. 顏色函式（根據 AQI） ----------
+      function colorForAqi(aqi) {
+        if (aqi <= 50) return '#009966'; // 綠
+        if (aqi <= 100) return '#ffde33'; // 黃
+        if (aqi <= 150) return '#ff9933'; // 橙
+        if (aqi <= 200) return '#cc0033'; // 紅
+        if (aqi <= 300) return '#660099'; // 紫
+        return '#7e0023'; // 褐/危險
+      }
+
+      // ---------- 6. PM2.5 -> AQI 計算 (EPA) ----------
+      // 參考 EPA breakpoint，逐段線性插值
+      function pm25ToAqi(pm25) {
+        // PM2.5 界點（μg/m3）與對應 AQI 範圍
+        const breaks = [
+          { c_lo: 0.0, c_hi: 12.0, i_lo: 0, i_hi: 50 },
+          { c_lo: 12.1, c_hi: 35.4, i_lo: 51, i_hi: 100 },
+          { c_lo: 35.5, c_hi: 55.4, i_lo: 101, i_hi: 150 },
+          { c_lo: 55.5, c_hi: 150.4, i_lo: 151, i_hi: 200 },
+          { c_lo: 150.5, c_hi: 250.4, i_lo: 201, i_hi: 300 },
+          { c_lo: 250.5, c_hi: 350.4, i_lo: 301, i_hi: 400 },
+          { c_lo: 350.5, c_hi: 500.4, i_lo: 401, i_hi: 500 },
+        ];
+        // 若 pm25 超過範圍，回傳 >500 的 AQI
+        if (pm25 >= 500.5) return 999;
+
+        for (let b of breaks) {
+          if (pm25 >= b.c_lo && pm25 <= b.c_hi) {
+            // 線性插值公式： I = ((Ihi - Ilo)/(Chi - Clo)) * (C - Clo) + Ilo
+            const Ihi = b.i_hi;
+            const Ilo = b.i_lo;
+            const Chi = b.c_hi;
+            const Clo = b.c_lo;
+            const C = pm25;
+            const a = (Ihi - Ilo) / (Chi - Clo);
+            const I = Math.round(a * (C - Clo) + Ilo);
+            return I;
+          }
+        }
+        return -1; // fallback
+      }
+
+      // ---------- 7. 依使用者選擇的 metric 決定顏色 ----------
+      function colorForMetric(rec, metric) {
+        // rec 可能沒有全部欄位，先處理 null
+        if (!rec) return '#888';
+        if (metric === 'aqi' || metric === 'pm2_5') {
+          // 用 pm2.5 轉 AQI 為顏色基準（pm25 也可直接顯示數值）
+          const pm = Number(rec.pm2_5);
+          if (isNaN(pm)) return '#888';
+          const aqi = pm25ToAqi(pm);
+          return colorForAqi(aqi);
+        }
+        // 其他簡單閾值（示範用）
+        if (metric === 'pm1_0') {
+          const v = Number(rec.pm1_0);
+          if (isNaN(v)) return '#888';
+          if (v <= 35) return '#009966';
+          if (v <= 75) return '#ffde33';
+          if (v <= 150) return '#ff9933';
+          return '#cc0033';
+        }
+        if (metric === 'pm10') {
+          const v = Number(rec.pm10);
+          if (isNaN(v)) return '#888';
+          if (v <= 50) return '#009966';
+          if (v <= 100) return '#ffde33';
+          if (v <= 250) return '#ff9933';
+          return '#cc0033';
+        }
+        if (metric === 'mq135') {
+          // MQ135 是 raw 數值，顏色用相對閾值 (示意)
+          const v = Number(rec.mq135);
+          if (isNaN(v)) return '#888';
+          if (v <= 300) return '#009966';
+          if (v <= 450) return '#ffde33';
+          if (v <= 600) return '#ff9933';
+          return '#cc0033';
+        }
+        if (metric === 'temp') {
+          const v = Number(rec.temp);
+          if (isNaN(v)) return '#888';
+          if (v <= 28) return '#009966';
+          if (v <= 32) return '#ffde33';
+          if (v <= 36) return '#ff9933';
+          return '#cc0033';
+        }
+        if (metric === 'hum') {
+          const v = Number(rec.hum);
+          if (isNaN(v)) return '#888';
+          if (v <= 60) return '#009966';
+          if (v <= 75) return '#ffde33';
+          return '#ff9933';
+        }
+        return '#888';
+      }
+
+      // ---------- 8. 更新或新增 marker 的 function ----------
+      function upsertMarker(deviceId, rec) {
+        if (!rec || rec.lat == null || rec.lng == null) return;
+        const lat = Number(rec.lat);
+        const lng = Number(rec.lng);
+        const metric = metricSelect.value;
+        const color = colorForMetric(rec, metric);
+
+        function updateHeatLayer() {
+          const points = [];
+          Object.values(latestData).forEach((rec) => {
+            if (!rec || rec.lat == null || rec.lng == null) return;
+            const lat = Number(rec.lat);
+            const lng = Number(rec.lng);
+
+            // 強度用 PM2.5 或其他指標
+            const metric = metricSelect.value;
+            let intensity = 1;
+            if (metric === 'pm25' || metric === 'aqi')
+              intensity = Number(rec.pm25) || 0;
+            else if (metric === 'pm10') intensity = Number(rec.pm10) || 0;
+            else if (metric === 'pm1_0') intensity = Number(rec.pm1_0) || 0;
+
+            points.push([lat, lng, intensity]);
+          });
+
+          if (heatLayer) map.removeLayer(heatLayer);
+          heatLayer = L.heatLayer(points, {
+            radius: 25,
+            blur: 15,
+            maxZoom: 17,
+            max: 500,
+          });
+          if (viewModeSelect.value === 'heat') {
+            heatLayer.addTo(map);
+          }
+        }
+
+        console.log('新增 marker', deviceId, lat, lng);
+
+        const popupHtml = `<b>${deviceId}</b><br/>
+      PM2.5: ${rec.pm2_5 ?? '-'}<br/>
+      PM1_0: ${rec.pm1_0 ?? '-'}<br/>
+      PM10: ${rec.pm10 ?? '-'}<br/>
+      MQ135: ${rec.mq135 ?? '-'}<br/>
+      Temp: ${rec.temp ?? '-'} °C<br/>
+      Hum: ${rec.hum ?? '-'} %<br/>
+      ${rec.timestamp ?? ''}`;
+
+        if (markers[deviceId]) {
+          markers[deviceId].setLatLng([lat, lng]);
+          // Leaflet marker 改顏色要用 circleMarker 或替換 icon，這裡用 circle marker
+          markers[deviceId].setStyle({ color: color, fillColor: color });
+          markers[deviceId].setPopupContent(popupHtml);
+        } else {
+          markers[deviceId] = L.circleMarker([lat, lng], {
+            radius: 10,
+            color: color,
+            fillColor: color,
+            fillOpacity: 0.7,
+            weight: 1,
+          })
+            .addTo(map)
+            .bindPopup(popupHtml);
+        }
+      }
+
+      // ---------- 9. 監聽 Firebase （整個 air_monitoring 節點） ----------
+      const rootRef = db.ref('devices');
+      rootRef.on(
+        'value',
+        (snap) => {
+          const root = snap.val();
+          if (!root) {
+            statusEl.textContent = '無資料';
+            return;
+          }
+          statusEl.textContent = '連線正常';
+          // 固定與移動都處理
+          ['fixed', 'mobile'].forEach((group) => {
+            const groupData = root[group] || {};
+            Object.keys(groupData).forEach((devId) => {
+              const rec =
+                groupData[devId] && groupData[devId].current
+                  ? groupData[devId].current
+                  : null;
+              latestData[devId] = rec;
+              upsertMarker(devId, rec);
+            });
+          });
+        },
+        (err) => {
+          console.error('Firebase on error', err);
+          statusEl.textContent = '讀取錯誤';
+        }
+      );
+
+      // ---------- 10. 當使用者切換 metric 時更新顏色（但不重新下載資料） ----------
+      metricSelect.addEventListener('change', () => {
+        if (viewModeSelect.value === 'markers') {
+          // 顯示所有 marker
+          Object.values(markers).forEach((m) => m.addTo(map));
+          // 移除熱力圖
+          if (heatLayer) map.removeLayer(heatLayer);
+        } else if (viewModeSelect.value === 'heat') {
+          // 移除所有 marker
+          Object.values(markers).forEach((m) => map.removeLayer(m));
+          // 加上熱力圖
+          if (heatLayer) heatLayer.addTo(map);
+        }
+        Object.keys(latestData).forEach((devId) => {
+          upsertMarker(devId, latestData[devId]);
+          updateHeatLayer();
+        });
+      });
+    </script>
+  </body>
+</html>
