@@ -107,9 +107,9 @@
         zoom: 14, // 固定縮放等級
         dragging: true, // 禁止拖曳
         scrollWheelZoom: true, // 禁止滑鼠滾輪縮放
-        doubleClickZoom: false, // 禁止雙擊縮放
-        boxZoom: false, // 禁止框選縮放
-        touchZoom: false, // 禁止手機捏合縮放
+        doubleClickZoom: true, // 禁止雙擊縮放
+        boxZoom: true, // 禁止框選縮放
+        touchZoom: true, // 禁止手機捏合縮放
       }).setView([23.47, 120.46], 14);
       L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
         attribution: '© OpenStreetMap',
